@@ -69,7 +69,7 @@ python tools/build_firmware.py --board metalio47 --idf-metalio47 "$IDF_PATH" --p
 
 - 整机固件底座：厂长 **kiikoread**
 - 微信读书功能框架：**设计君的日常碎碎念**（[kiikoreader-wereader](https://github.com/YIYO-Designer/kiikoreader-wereader)）
-- 划线实现参考：**沉在阅读**
+- 划线实现参考：**沉在阅读**（GitHub: [cyongxiang](https://github.com/cyongxiang)）
 
 ## 安全
 
