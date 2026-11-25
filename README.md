@@ -22,6 +22,8 @@
 
 **AI 能力**
 
+> 这一部分的能力设计与模型接入方式参考了月读插件（[AnkioTomas/moon](https://github.com/AnkioTomas/moon)）。
+
 - 新增 **AI 设置选项**，可配置模型与调用方式。
 - **想法 AI 归纳**：把一章里的零散想法、段评归纳成结构化摘要。
 - **长按文本 AI 解释与翻译**：选中即解释、即翻译，不需要跳出阅读。
@@ -72,6 +74,7 @@ python tools/build_firmware.py --board metalio47 --idf-metalio47 "$IDF_PATH" --p
   - Pico 项目：[wegooo-cell/read-pico-reader](https://github.com/wegooo-cell/read-pico-reader)
 - 微信读书功能框架：**设计君的日常碎碎念**（[YIYO-Designer/kiikoreader-wereader](https://github.com/YIYO-Designer/kiikoreader-wereader)）
 - 划线实现参考：**沉在阅读**（GitHub: [cyongxiang](https://github.com/cyongxiang)）
+- AI 归纳与模型接入参考：**月读**（GitHub: [AnkioTomas/moon](https://github.com/AnkioTomas/moon)，KOReader 插件 book.koplugin / Moon）
 - 更上游的 Pico 示例固件：[MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware)（Apache-2.0）
 - 硬件参考：[CloudZao/Metalio-E-INK4-Plus](https://github.com/CloudZao/Metalio-E-INK4-Plus)
 
