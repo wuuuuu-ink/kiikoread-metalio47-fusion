@@ -182,6 +182,26 @@ static app_redraw_t begin_login(app_ctx_t *ctx) {
     return enter_consent_login();
 }
 
+/* 账户页"续期会话"：先 wr_rt 续期，失败用 consent 重新 mint，免扫码；都失败才给重新扫码出路。
+ * "Renew session" on the account page: wr_rt renewal then consent mint, no QR; re-scan only as fallback. */
+static app_redraw_t renew_now(app_ctx_t *ctx) {
+    (void)ctx;
+    if (wr_status(NULL, 0, NULL, NULL) == WR_BUSY) {
+        s_message = "后台任务进行中，请稍候";
+        return APP_REDRAW_PAGE;
+    }
+    if (wr_renew_session()) {
+        s_login_invalid = false;
+        s_session_verified_us = 0;
+        s_check_pending = true;
+        refresh_shelf();
+        s_message = "会话已续期，可继续下载/同步";
+        return APP_REDRAW_PAGE;
+    }
+    s_message = "续期失败，请重新扫码授权";
+    return begin_fresh_consent();
+}
+
 static void connect_wifi(app_ctx_t *ctx) {
     app_transfer_request_wifi_then_return();
     ctx->request_app = &app_transfer;
@@ -438,7 +458,7 @@ static void shelf(uint8_t *fb) {
     /* 登录失效提示：放在状态栏（中心 y=40）与标题（y=86）之间的空闲条带，单行不与任何控件重叠。 */
     if (s_login_invalid && s_view == SHELF)
         ui_text_vc(fb, UI_LOCK_WIDTH / 2, 70, 20,
-                   "登录状态失效，请前往账户重新扫码", EPD_DRAW_ALIGN_CENTER, false);
+                   "登录状态失效，请前往账户续期会话或重新扫码", EPD_DRAW_ALIGN_CENTER, false);
     app_book_shelf_header(fb,false,"同步",s_pressed==0);
     app_book_shelf_header(fb,true,"账户",s_pressed==1);
     bool list = app_settings_shelf_style() == 5;
@@ -530,6 +550,8 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
         button(fb,action_rect(2),logged?"退出登录":"扫码登录",true);
         button(fb,action_rect(3),"返回书架",true);
         if (s_view == ACCOUNT) button(fb,action_rect(4),"时长同步",true);
+        if (s_view == ACCOUNT && logged)
+            button(fb,action_rect(5), s_login_invalid ? "续期会话（当前失效）" : "续期会话", true);
     }
     if (s_view == SYNC) {
         title(fb,"时长同步");
@@ -555,7 +577,9 @@ static void render(app_ctx_t *ctx, uint8_t *fb) {
                     EPD_DRAW_ALIGN_CENTER,false);
         button(fb,sync_button_rect(0),pending?"立即补传":"暂无待补传",pending&&online);
         button(fb,sync_button_rect(1),authorized?"授权管理":"授权离线补传",online);
-        button(fb,sync_button_rect(2),"返回账户",true);
+        button(fb,sync_button_rect(2),
+               app_settings_reader_fast_replay()?"快速补传：开":"快速补传：关",true);
+        button(fb,sync_button_rect(3),"返回账户",true);
     }
     if (s_view == CONSENT) {
         /* 登录与离线补传已合并为同一次扫码授权，标题不再写"授权离线时长"，用中性名称。 */
@@ -1142,6 +1166,7 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *event) {
         }
         if (ui_rect_hit(action_rect(3),x,y)) { s_view=SHELF; s_message=NULL; return APP_REDRAW_PAGE; }
         if (ui_rect_hit(action_rect(4),x,y)) { s_view=SYNC; s_message=NULL; return APP_REDRAW_PAGE; }
+        if (ui_rect_hit(action_rect(5),x,y)) return renew_now(ctx);
         return APP_REDRAW_NONE;
     }
     if (s_view == SYNC) {
@@ -1158,7 +1183,14 @@ static app_redraw_t gesture(app_ctx_t *ctx,const ui_gesture_event_t *event) {
             /* 进入授权页：已授权则显示管理，未授权则发起扫码。 */
             return enter_consent_login();
         }
-        if (ui_rect_hit(sync_button_rect(2),x,y)) { s_view=ACCOUNT; s_message=NULL; return APP_REDRAW_PAGE; }
+        if (ui_rect_hit(sync_button_rect(2),x,y)) {
+            /* 开关直接反映在按钮文字上，不弹模态提示，避免每次切换都多一次点击。
+             * The button label carries the state; no modal, so toggling stays one tap. */
+            if (!app_settings_set_reader_fast_replay(!app_settings_reader_fast_replay()))
+                s_message = "保存设置失败，请重试";
+            return APP_REDRAW_PAGE;
+        }
+        if (ui_rect_hit(sync_button_rect(3),x,y)) { s_view=ACCOUNT; s_message=NULL; return APP_REDRAW_PAGE; }
         return APP_REDRAW_NONE;
     }
     if (s_view == CONSENT) {

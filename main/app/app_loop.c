@@ -455,7 +455,14 @@ static void app_present_impl(app_ctx_t* ctx, const app_desc_t* app, app_redraw_t
         display_main_transition_cancel();
         ui_text_set_system_scale(true);
         bool prepared=redraw==APP_REDRAW_PAGE?display_page_prepare_begin():false;
+        const int64_t render_started=esp_timer_get_time();
         if (app->render) app->render(ctx, ctx->fb);
+        const int64_t render_ms=(esp_timer_get_time()-render_started)/1000;
+        /* 慢帧探针：只报 ≥80ms 的合成耗时，便于区分"排版/解图慢"与"墨水屏刷新慢"。
+         * Slow-frame probe: log composites ≥80 ms so layout/decode cost is separable from the
+         * panel refresh itself. */
+        if(render_ms>=80)
+            ESP_LOGW(TAG,"slow render %lldms redraw=%d",(long long)render_ms,(int)redraw);
         // 动画和高层区域都使用旋转后逻辑坐标；物理全屏会触发裁剪错误与整屏恢复。
         // Animation/high-level areas use rotated logical coordinates; a physical full screen causes crop failure and full recovery.
         const EpdRect screen={0,0,epd_rotated_display_width(),
@@ -520,7 +527,14 @@ static void app_present_impl(app_ctx_t* ctx, const app_desc_t* app, app_redraw_t
     const bool prepare_page=redraw==APP_REDRAW_PAGE&&navigation_page_ready(ctx,app);
     const bool prepare_held=prepare_page?display_page_prepare_begin():false;
 #endif
-    if (app->present != NULL && app->present(ctx, redraw)) {
+    const int64_t present_started=esp_timer_get_time();
+    const bool presented=app->present != NULL && app->present(ctx, redraw);
+    if (presented) {
+        /* 阅读翻页等自绘应用的合成耗时探针，与上面的 render 探针互补。
+         * Composite-cost probe for self-drawing apps such as reader turns. */
+        const int64_t present_ms=(esp_timer_get_time()-present_started)/1000;
+        if(present_ms>=80)
+            ESP_LOGW(TAG,"slow present %lldms redraw=%d",(long long)present_ms,(int)redraw);
 #if KIIKO_BOARD_METALIO47
         if(prepare_page)display_page_prepare_end(prepare_held);
 #endif

@@ -60,7 +60,7 @@
 #define WR_QUEUE_BACKUP WR_DIR "/rtime.prev"
 #define WR_QUEUE_MAGIC "WRQUEUE2"   /* 现行格式：带阅读位置，重启后补传不再归零 */
 #define WR_QUEUE_MAGIC_LEGACY "WRQUEUE1" /* 旧格式：仅书目/账号/秒数，仍可读 */
-#define WR_QUEUE_MAX 12
+#define WR_QUEUE_MAX 24
 
 /* 退出阅读后的"阅读进度位置"同步队列：与时长队列分开，记录每本书最近一次本地位置。
  * 在线由 worker 立即经 /web/book/read 上报；离线落盘，联网恢复后自动补传。 */
@@ -171,6 +171,10 @@ static bool s_queue_restored;
  * Whether the queue was successfully persisted this session; once written, RAM is authoritative
  * and an empty queue may safely unlink even without a prior boot-time restore. */
 static bool s_queue_written;
+/* 队列脏标记：离线阅读时由 UI 任务置位，由 worker 落盘。SD 写入不再占用 UI 线程。
+ * Dirty flag: the UI task marks it, the worker writes. SD I/O never blocks the UI task. */
+static volatile bool s_queue_dirty;
+static int64_t s_queue_persist_retry_at;
 /* 补传成功通知：每次服务器确认一条离线时长，序号 +1，并记下该次确认秒数，供 UI 弹窗。
  * Confirmation notification: the sequence increments (and the seconds are recorded) each
  * time the server confirms an offline-duration record, so the UI can show a success popup. */
@@ -648,6 +652,28 @@ static esp_err_t capture_keepalive_event(esp_http_client_event_t *event) {
     if (!request) return ESP_OK;
     if (event->event_id == HTTP_EVENT_HEADERS_SENT && request->post_started) {
         *request->post_started = true;
+    }
+    /*
+     * 收到 Content-Length 就一次性按精确大小预留 PSRAM：否则 4 KB 起每满一次翻倍，
+     * 一个 370 KB 章包要 realloc/拷贝 7 次，峰值多占一份旧块。预分配只做一次，
+     * 失败也不致命——后面的按需增长照样兜底。
+     * Preallocate the exact Content-Length once: otherwise the 4 KB start doubles seven times for a
+     * 370 KB bundle, copying and briefly holding the old block each time. A failed preallocation is
+     * harmless because the incremental growth path still applies.
+     */
+    if (event->event_id == HTTP_EVENT_ON_HEADER && request->capture_body &&
+        event->header_key && event->header_value &&
+        !strcasecmp(event->header_key, "Content-Length")) {
+        const unsigned long long announced = strtoull(event->header_value, NULL, 10);
+        if (announced > 0 && announced <= request->body_limit &&
+            announced > request->body_capacity) {
+            char *exact = heap_caps_realloc(request->body_data, (size_t)announced + 1,
+                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (exact) {
+                request->body_data = exact;
+                request->body_capacity = (size_t)announced;
+            }
+        }
     }
     if (event->event_id == HTTP_EVENT_ON_DATA && request->capture_body) {
         if (wr_cancelled()) return ESP_FAIL;
@@ -1482,6 +1508,16 @@ char *wr_http_report(const char *body, const char *referer, bool *post_started) 
 }
 
 static void *json_alloc(size_t size) { return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT); }
+static void json_free(void *ptr) { heap_caps_free(ptr); }
+
+/* 让 cJSON 解析树全部落在 PSRAM：readreviews 单次回包可达 70~80 万字节，
+ * 默认 cJSON 走内部 RAM（仅 ~224KB）会撑爆，连锁导致 wifi:mem fail、最终
+ * newlib 文件锁互斥量创建失败 abort。PSRAM 有 16MB，足够。
+ * Route all cJSON allocations to PSRAM to avoid exhausting the tiny internal RAM pool. */
+static void wr_install_cjson_hooks(void) {
+    cJSON_Hooks hooks = { .malloc_fn = json_alloc, .free_fn = json_free };
+    cJSON_InitHooks(&hooks);
+}
 
 /* JSON 里的"成功"标记：true / 1 / "1" / "true" 都算。
  * A success flag in JSON: true, 1, "1" and "true" all count. */
@@ -2104,10 +2140,107 @@ static bool check_session(void) {
     return valid;
 }
 
+/* 从文件名反推 library：存在 <owner>+<book>.cc 说明这本书属于本账号，再去书架目录找
+ * wr-<8 位十六进制>+<book>.epub，那段十六进制就是 library。
+ * Derive the library from file names: a summary <owner>+<book>.cc proves ownership, and the
+ * book file wr-<8 hex>+<book>.epub then yields the library. */
+static bool library_from_epub(const char *book_id, uint32_t *out) {
+    const char *root = app_settings_books_dir();
+    if (!root || !root[0] || !wr_safe(book_id) || !out) return false;
+    char dir_path[WR_PATH];
+    int n = snprintf(dir_path, sizeof(dir_path), "%s", root);
+    if (n <= 0 || n >= (int)sizeof(dir_path)) return false;
+    char suffix[WR_ID + 8];
+    n = snprintf(suffix, sizeof(suffix), "%s.epub", book_id);
+    if (n <= 0 || n >= (int)sizeof(suffix)) return false;
+    WR_SD_SCOPE(dir_path);
+    if (!scope.allowed) return false;
+    DIR *dir = opendir(dir_path);
+    if (!dir) return false;
+    bool found = false;
+    struct dirent *entry;
+    unsigned scanned = 0;
+    while (!found && (entry = readdir(dir)) != NULL && ++scanned <= 512) {
+        const char *name = entry->d_name;
+        if (strncmp(name, "wr-", 3)) continue;
+        const char *plus = strchr(name + 3, '+');
+        if (!plus || (size_t)(plus - (name + 3)) != 8 || strcmp(plus + 1, suffix)) continue;
+        char hex[9];
+        memcpy(hex, name + 3, 8);
+        hex[8] = 0;
+        char *end = NULL;
+        unsigned long value = strtoul(hex, &end, 16);
+        if (end && !*end && value) { *out = (uint32_t)value; found = true; }
+    }
+    closedir(dir);
+    return found;
+}
+
+static uint32_t recover_library_from_names(const char *owner) {
+    if (!wr_safe(owner) || !owner[0]) return 0;
+    WR_SD_SCOPE(WR_DIR);
+    if (!scope.allowed) return 0;
+    DIR *dir = opendir(WR_DIR);
+    if (!dir) return 0;
+    const size_t prefix_len = strlen(owner);
+    uint32_t library = 0;
+    unsigned tried = 0;
+    struct dirent *entry;
+    while (!library && (entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        size_t len = strlen(name);
+        if (strncmp(name, owner, prefix_len) || name[prefix_len] != '+' ||
+            len < prefix_len + 4 || strcmp(name + len - 3, ".cc")) continue;
+        if (++tried > 16) break;
+        size_t id_len = len - prefix_len - 1 - 3;
+        if (!id_len || id_len >= WR_ID) continue;
+        char book[WR_ID];
+        memcpy(book, name + prefix_len + 1, id_len);
+        book[id_len] = 0;
+        (void)library_from_epub(book, &library);
+    }
+    closedir(dir);
+    return library;
+}
+
+/* 只按文件名反推，不读 cached.bin、不写任何东西：登录流程里做太多 SD 操作会拖住缓存。
+ * 反推依据：<owner>+<book>.cc 证明归属，wr-<8 位十六进制>+<book>.epub 给出 library。
+ * Only derive from names: no cached.bin reads and no writes in the login path, because heavy SD
+ * work there would stall caching. <owner>+<book>.cc proves ownership and the book file yields
+ * the library. */
+static uint32_t recover_library(const char *owner) {
+    uint32_t library = recover_library_from_names(owner);
+    if (library) ESP_LOGW("WEREAD", "recovered library=%08x owner=%s", (unsigned)library, owner);
+    return library;
+}
+
+/* 启动时修复历史错配：NVS 里已有账号，但 library 与 SD 上的缓存文件不一致（整片擦除后
+ * 重新登录过一次）。只在本账号确有缓存证据时改，找不到就不动。
+ * Repair a historical mismatch at boot: NVS already has an account whose library no longer
+ * matches the cache on the card. Only rewrite it when this account really has cache evidence. */
+static void repair_account_library(void) {
+    wr_account_t account;
+    if (!read_account(&account) || !wr_safe(account.owner) || !account.owner[0]) return;
+    uint32_t found = recover_library(account.owner);
+    if (!found || found == account.library) return;
+    uint32_t previous = account.library;
+    account.library = found;
+    if (!save_account(&account)) { ESP_LOGW("WEREAD", "library repair save failed"); return; }
+    s_http_account = account;
+    ESP_LOGW("WEREAD", "library repaired %08x -> %08x owner=%s",
+             (unsigned)previous, (unsigned)found, account.owner);
+}
+
 /* 用 consent 三件套经 POST /web/login/session/init 自动建立网页会话：一次墨水屏扫码即可，
    无需第二次网页扫码。Set-Cookie 的 wr_* 由 capture_cookie 自动捕获并落盘，随后填充账号态。
    网页会话过期时可用已存 consent token 重新 mint，用户无感。返回 true 表示网页会话已就绪。 */
 bool wr_mint_web_session(void) {
+    /* mint 建立全新网页会话：起步前必须清掉残留的"已过期"标记，否则 http_request 在
+     * 复用通路失败后会因 s_expired 跳过全新连接回退，重新扫码后 mint 永远失败、必须重启。
+     * A mint builds a brand-new session: clear any stale expired flag up front, or http_request
+     * skips the fresh-connection fallback after a pooled failure and the post-rescan mint can
+     * never succeed until reboot. */
+    s_expired = false;
     char vid[WR_ID], access[384], refresh[384];
     if (!wr_consent_tokens(vid, sizeof(vid), access, sizeof(access), refresh, sizeof(refresh))) {
         ESP_LOGW("WEREAD", "mint unavailable: no consent tokens");
@@ -2149,11 +2282,16 @@ bool wr_mint_web_session(void) {
         ESP_LOGW("WEREAD", "mint ok but wr_skey missing");
         return false;
     }
-    /* 填账号态：同号保留原 library，换号才重新生成。 */
+    /* 填账号态：同号保留原 library；NVS 被擦除/换机时先从 SD 反推旧 library，避免旧书全部
+     * 变成“未缓存”，最后才生成新值。
+     * Keep the library for the same account; after an NVS erase recover the old one from the card
+     * before inventing a new value, so existing books keep their cache badges. */
     wr_account_t account = {0};
     snprintf(account.owner, sizeof(account.owner), "%s", vid);
     snprintf(account.token, sizeof(account.token), "%s", access);
-    account.library = !strcmp(s_http_account.owner, vid) ? s_http_account.library : esp_random();
+    account.library = !strcmp(s_http_account.owner, vid) ? s_http_account.library : 0;
+    if (!account.library) account.library = recover_library(vid);
+    if (!account.library) account.library = esp_random();
     if (!save_account(&account)) {
         ESP_LOGW("WEREAD", "mint account save failed");
         return false;
@@ -2169,6 +2307,11 @@ bool wr_mint_web_session(void) {
 }
 
 bool wr_clear_web_session(void) {
+    /* consent 取消授权时一并清网页会话：清掉过期残留标记并断开复用连接，理由同 wr_logout。
+     * Clearing the web session on consent revocation: drop the stale expired flag and the pooled
+     * connection, same rationale as wr_logout. */
+    s_expired = false;
+    http_keepalive_drop();
     wr_account_t account;
     if (read_account(&account)) {
         memset(account.token, 0, sizeof(account.token));
@@ -2178,8 +2321,23 @@ bool wr_clear_web_session(void) {
     return clear_session_cookies();
 }
 
+/* 手动续期网页会话：先 wr_rt cookie 续期（/web/login/renewal），走不通再用 consent 重新
+ * mint 一个全新网页会话，全程免扫码。供账户页"续期会话"按钮调用。
+ * Manual session renewal: wr_rt cookie renewal first (/web/login/renewal), then a fresh consent
+ * mint if that cannot proceed — no QR scan. Called by the account-page "renew session" button. */
+bool wr_renew_session(void) {
+    return renew_session();
+}
+
 bool wr_logout(bool remove_books) {
     if (wr_status(NULL, 0, NULL, NULL) == WR_BUSY) return false;
+    /* 退出即清掉"已过期"残留标记并断开旧会话的复用连接：标记残留会让重新扫码后的 mint
+     * 被 http_request 的 s_expired gate 拦死；旧连接可能已被服务端空闲关闭，复用到新会话
+     * 上只会增加一次失败。/ Clear the stale expired flag and drop the old pooled connection on
+     * logout: a leftover flag blocks the post-rescan mint at http_request's s_expired gate, and
+     * the old connection may already be idle-closed by the server. */
+    s_expired = false;
+    http_keepalive_drop();
     wr_account_t account;
     if (!read_account(&account)) return true;
     if (remove_books) {
@@ -2614,11 +2772,62 @@ bool wr_reporting_book(const char *path, wr_book_t *book) {
 
 typedef enum { REPORT_RETRY, REPORT_CONFIRMED, REPORT_UNKNOWN, REPORT_ACCOUNT_CHANGED } report_result_t;
 
-/* 离线时长回放：把攒下的补传秒数切成 30 秒的心跳小段，按真实节奏（间隔 30s）一拍一拍补报，
- * 每拍 ct 取当前时间、rt=本拍秒数，先进入会话再上报，和真人实时阅读的口径一致。
- * Replay offline duration as 30 s real-time heartbeats, spaced 30 s apart, ct=now each. */
+/* 离线时长回放：把攒下的补传秒数切片补报，每片 ct 取当前时间、rt=本片秒数。
+ * 默认（快速补传开）自适应：起始 60 秒/片，连续确认后翻倍到 600 秒，片间 30s→8s→3s；
+ * 关闭开关或连续失败时完全回到原来的 30 秒/片、30 秒间隔。
+ * Replay offline duration in chunks, ct=now each. With fast replay on, chunks start at 60 s and
+ * double to 600 s while confirmations keep coming, and the gap shrinks 30 s → 8 s → 3 s. Turning
+ * the switch off (or a failure) restores the original 30 s chunk and 30 s gap. */
 #define WR_REPLAY_CHUNK_SECONDS 30u
+#define WR_REPLAY_CHUNK_MIN 60u
+#define WR_REPLAY_CHUNK_MAX 600u
 #define WR_REPLAY_INTERVAL_US   INT64_C(30000000)
+#define WR_REPLAY_GAP_MID_US    INT64_C(8000000)
+#define WR_REPLAY_GAP_FAST_US   INT64_C(3000000)
+/* 连发 3 片后歇 10 秒，避免长时间占着射频与 CPU。/ Rest 10 s after 3 chunks. */
+#define WR_REPLAY_BURST_MAX 3u
+#define WR_REPLAY_GAP_REST_US   INT64_C(10000000)
+/* 任一片失败后冷却十分钟，期间回到 30 秒节奏，防止把风控试探变成连续请求。 */
+#define WR_REPLAY_COOLDOWN_US   INT64_C(600000000)
+
+/* P1 实验档：把分片上限抬到 1800/3600 秒，只在抓包验证服务端确实按 rt 计时后开启。
+ * 编译时用 -DWR_EXPERIMENT_CHUNK_MAX=1800 打开；默认 0 表示关闭，维持 600 秒上限。
+ * P1 experiment: raise the chunk cap to 1800/3600 s only after packet capture proves the server
+ * counts by rt. Enable with -DWR_EXPERIMENT_CHUNK_MAX=1800; 0 keeps the 600 s default. */
+#ifndef WR_EXPERIMENT_CHUNK_MAX
+#define WR_EXPERIMENT_CHUNK_MAX 0
+#endif
+#if WR_EXPERIMENT_CHUNK_MAX > 0
+#undef WR_REPLAY_CHUNK_MAX
+#define WR_REPLAY_CHUNK_MAX ((unsigned)WR_EXPERIMENT_CHUNK_MAX)
+#endif
+
+static unsigned s_replay_chunk = WR_REPLAY_CHUNK_MIN;
+static unsigned s_replay_streak;
+static unsigned s_replay_burst;
+static int64_t s_replay_cooldown_until;
+
+static bool replay_fast(void) {
+    return app_settings_reader_fast_replay() && s_replay_cooldown_until <= esp_timer_get_time();
+}
+
+static unsigned replay_chunk_seconds(void) {
+    return replay_fast() ? s_replay_chunk : WR_REPLAY_CHUNK_SECONDS;
+}
+
+static int64_t replay_gap_us(void) {
+    if (!replay_fast()) return WR_REPLAY_INTERVAL_US;
+    if (s_replay_streak >= 10) return WR_REPLAY_GAP_FAST_US;
+    if (s_replay_streak >= 3) return WR_REPLAY_GAP_MID_US;
+    return WR_REPLAY_INTERVAL_US;
+}
+
+static void replay_note_failure(void) {
+    s_replay_chunk = WR_REPLAY_CHUNK_MIN;
+    s_replay_streak = 0;
+    s_replay_burst = 0;
+    s_replay_cooldown_until = esp_timer_get_time() + WR_REPLAY_COOLDOWN_US;
+}
 
 static bool same_report_book(const wr_report_t *a, const wr_report_t *b) {
     return a->library == b->library && !strcmp(a->owner, b->owner) && !strcmp(a->book_id, b->book_id);
@@ -2653,10 +2862,10 @@ static report_result_t run_report(const wr_report_t *job, const char **stage, un
     *stage = "offline";
     if (!wr_online()) return REPORT_RETRY;
 
-    /* 离线补传回放：每拍只发 30 秒（最后一拍带零头），首拍先进入会话；在线实时任务整拍发。
+    /* 离线补传回放：每片发送自适应片长（最后一拍带零头），首拍先进入会话；在线实时任务整拍发。
      * 本拍真正上报的秒数经 sent_seconds 交回 process_report，确认后只扣这一拍。 */
-    unsigned send_seconds = job->resend && job->seconds > WR_REPLAY_CHUNK_SECONDS
-                            ? WR_REPLAY_CHUNK_SECONDS : job->seconds;
+    unsigned send_seconds = job->resend && job->seconds > replay_chunk_seconds()
+                            ? replay_chunk_seconds() : job->seconds;
     bool enter = job->resend && !job->entered;
     *sent_seconds = send_seconds;
 
@@ -2697,9 +2906,13 @@ static report_result_t run_report(const wr_report_t *job, const char **stage, un
     /* ===== 主路径：网页 /web/book/read（v2 实证可计时；wr_* cookie 由 consent mint 自动建立）。
      * 完整双签名，ct 取当前时间、首拍先进入会话，离线时长按 30 秒一拍实时回放，服务端才真正计时。===== */
     if (have_position) {
-        bool cached = s_report_fields.expires > esp_timer_get_time() &&
-            same_report_book(job, &s_report_fields.account_book) &&
-            !strcmp(chapter.id, s_report_fields.chapter);
+        /* 补传同一章内复用阅读器字段直到章节变化：每片重新拉一次阅读页会把补传速度
+         * 卡在网络往返上。实时上报仍按 5 分钟过期，避免长时间复用陈旧令牌。
+         * Reuse reader fields for the whole chapter while replaying: refetching the reader page
+         * per chunk caps the drain at network latency. Real-time reports keep the 5 min TTL. */
+        bool cached = same_report_book(job, &s_report_fields.account_book) &&
+            !strcmp(chapter.id, s_report_fields.chapter) &&
+            (job->resend || s_report_fields.expires > esp_timer_get_time());
         ESP_LOGI("WEREAD", "report reader fields cache_hit=%d seconds=%u", cached, job->seconds);
         bool fields_ready = cached;
         if (!cached) {
@@ -2709,7 +2922,8 @@ static report_result_t run_report(const wr_report_t *job, const char **stage, un
                 if (wr_reader(job->book_id, chapter.id, &s_report_fields.fields)) {
                     s_report_fields.account_book = *job;
                     memcpy(s_report_fields.chapter, chapter.id, sizeof(chapter.id));
-                    s_report_fields.expires = esp_timer_get_time() + 300000000;
+                    s_report_fields.expires = esp_timer_get_time() +
+                        (job->resend ? 1800000000LL : 300000000LL);
                     fields_ready = true;
                 }
             }
@@ -2783,9 +2997,10 @@ static report_result_t run_report(const wr_report_t *job, const char **stage, un
     return REPORT_RETRY;
 }
 
-static void process_report(unsigned slot, const wr_report_t *job) {
+static bool process_report(unsigned slot, const wr_report_t *job) {
     const char *stage;
     unsigned sent_seconds = 0;
+    const int64_t t_start = esp_timer_get_time();
     s_processing_report = true;
     report_result_t result = run_report(job, &stage, &sent_seconds);
     s_processing_report = false;
@@ -2818,11 +3033,25 @@ static void process_report(unsigned slot, const wr_report_t *job) {
             pending->seconds = 0;
             pending->retry_at = 0;
         } else if (job->resend && pending->seconds) {
-            /* 回放：本拍已确认，标记进入过会话、累计已补秒数，按真实节奏隔 30s 再补下一拍。
-             * This chunk is confirmed; mark entered and space the next chunk 30 s out. */
+            /* 回放：本片已确认，标记进入过会话、累计已补秒数，按自适应节奏排下一片。
+             * This chunk is confirmed; mark entered, count it, and schedule the next one. */
             pending->entered = true;
             pending->replay_done += sent_seconds;
-            pending->retry_at = now + WR_REPLAY_INTERVAL_US;
+            if (app_settings_reader_fast_replay()) {
+                if (s_replay_streak < 10) ++s_replay_streak;
+                if (s_replay_chunk < WR_REPLAY_CHUNK_MAX) {
+                    s_replay_chunk *= 2;
+                    if (s_replay_chunk > WR_REPLAY_CHUNK_MAX) s_replay_chunk = WR_REPLAY_CHUNK_MAX;
+                }
+                if (++s_replay_burst >= WR_REPLAY_BURST_MAX) {
+                    s_replay_burst = 0;
+                    pending->retry_at = now + WR_REPLAY_GAP_REST_US;
+                } else {
+                    pending->retry_at = now + replay_gap_us();
+                }
+            } else {
+                pending->retry_at = now + WR_REPLAY_INTERVAL_US;
+            }
         } else {
             pending->retry_at = 0;
             if (result == REPORT_CONFIRMED) pending->replay_done += sent_seconds;
@@ -2832,6 +3061,9 @@ static void process_report(unsigned slot, const wr_report_t *job) {
     unsigned drain_total = pending->replay_done;
     bool drain_finished = result == REPORT_CONFIRMED && remaining == 0;
     portEXIT_CRITICAL(&s_lock);
+    /* 失败/未知：放弃加速并冷却十分钟，避免把风控试探变成连续请求。
+     * Failure/unknown: drop the acceleration and cool down, so probing never turns into a burst. */
+    if (!offline && result != REPORT_CONFIRMED) replay_note_failure();
     /* 只有秒数真的变化才写盘：重试只挪内存里的退避时间，不必反复磨损 SD 卡。
      * Only persist when the seconds changed; a retry just moves the in-RAM backoff. */
     if (result != REPORT_RETRY) queue_persist();
@@ -2845,14 +3077,17 @@ static void process_report(unsigned slot, const wr_report_t *job) {
         static int64_t s_offline_logged_us;
         if (!s_offline_logged_us || now - s_offline_logged_us > 300000000LL) {
             s_offline_logged_us = now;
-            ESP_LOGI("WEREAD", "report parked offline seconds=%u pending=%u", job->seconds, remaining);
+            ESP_LOGI("WEREAD", "report parked offline seconds=%u pending=%u cost_ms=%u",
+                     job->seconds, remaining,
+                     (unsigned)((esp_timer_get_time() - t_start) / 1000));
         }
-        return;
+        return false;
     }
     const char *outcome = result == REPORT_CONFIRMED ? "confirmed" :
         result == REPORT_RETRY ? "retry" : result == REPORT_UNKNOWN ? "unknown" : "account_changed";
-    ESP_LOGI("WEREAD", "report result=%s stage=%s chunk=%u pending=%u",
-             outcome, stage, sent_seconds, remaining);
+    ESP_LOGI("WEREAD", "report result=%s stage=%s chunk=%u pending=%u cost_ms=%u",
+             outcome, stage, sent_seconds, remaining,
+             (unsigned)((esp_timer_get_time() - t_start) / 1000));
     if (drain_finished && job->resend) {
         /* 仅离线回放（resend）整批补完才记录确认、唤醒 UI 弹"离线补传成功"；
          * 联网实时报告（resend=false）确认后静默处理，绝不弹离线补传窗。
@@ -2860,6 +3095,7 @@ static void process_report(unsigned slot, const wr_report_t *job) {
         s_last_confirm_seconds = drain_total;
         ++s_confirm_seq;
     }
+    return result == REPORT_CONFIRMED;
 }
 
 /* 登记/取回被挡下的预取。放在 worker 里补跑，而不是让阅读页反复重试：
@@ -2906,8 +3142,25 @@ static void worker_task(void *arg) {
     }
     /* 开机先恢复离线落盘的阅读位置，等网络就绪后由 pos_flush 自动补传。 */
     pos_restore();
+    /* 缓存目录归属修正：必须等 SD 与账号状态都就绪后再做，只认有缓存证据的账号。 */
+    repair_account_library();
     for (;;) {
         int64_t now = esp_timer_get_time();
+        /* 队列落盘交给 worker：UI 任务只置脏标记，避免离线每 60 秒在翻页线程上写一次 SD。
+         * Persist on the worker: the UI task only sets the dirty flag, so offline batches no
+         * longer write the card on the paging thread every 60 s. */
+        if (s_queue_dirty && now >= s_queue_persist_retry_at) {
+            s_queue_dirty = false;
+            int64_t p0 = esp_timer_get_time();
+            bool saved = queue_persist();
+            int64_t cost_ms = (esp_timer_get_time() - p0) / 1000;
+            if (cost_ms >= 100)
+                ESP_LOGW("WEREAD", "queue persist cost_ms=%d", (int)cost_ms);
+            if (!saved) {
+                s_queue_dirty = true;
+                s_queue_persist_retry_at = now + 5000000;
+            }
+        }
         int slot = -1;
         bool pending = false;
         wr_report_t report;
@@ -2962,8 +3215,11 @@ static void worker_task(void *arg) {
                 vTaskDelay(pdMS_TO_TICKS(300));
             }
         } else if (slot >= 0) {
-            process_report((unsigned)slot, &report);
-            http_keepalive_drop();
+            bool confirmed = process_report((unsigned)slot, &report);
+            /* 连续确认时保留暖连接：每片都重握手会把补传时间耗在 TLS 上，也会和翻页抢 CPU。
+             * Keep the warm link while chunks keep confirming: a handshake per chunk burns the
+             * drain window on TLS and competes with paging. */
+            if (!confirmed) http_keepalive_drop();
         } else if (s_pos_count) {
             /* 有待同步阅读位置：在线即传，离线则最多等 1s 再检查网络状态。 */
             pos_flush();
@@ -3310,6 +3566,9 @@ static void queue_restore(void) {
 }
 
 void wr_init(void) {
+    /* cJSON 解析树改走 PSRAM：必须在任何 cJSON 解析（尤其 worker 下载 readreviews 大回包）之前安装。
+     * Install PSRAM hooks for cJSON before any parse (esp. worker's large readreviews responses). */
+    wr_install_cjson_hooks();
     /* 离线时长授权凭证在 SD 卡上，尽早恢复一次，后面的计时/补传才有凭据可用。 */
     wr_consent_init();
     /* 落盘的待补传队列也尽早装回来，否则重启就丢时长（这正是以前补不满的根因）。 */
@@ -3333,8 +3592,11 @@ void wr_init(void) {
     esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_STOP,
                                http_keepalive_link_event, NULL);
     book_set_virtual_resolver(wr_virtual_resolver);
-    s_worker = xTaskCreateStatic(worker_task, "weread", sizeof(s_worker_stack),
-                                 NULL, 2, s_worker_stack, &s_worker_tcb);
+    /* 固定到与 UI 不同的核心：app_main/界面在 CPU0，补传与网络放到 CPU1，翻页不被抢占。
+     * Pin to the core the UI is not on: app_main/UI run on CPU0, so replay and TLS live on CPU1
+     * and never preempt a page turn. */
+    s_worker = xTaskCreateStaticPinnedToCore(worker_task, "weread", sizeof(s_worker_stack),
+                                             NULL, 2, s_worker_stack, &s_worker_tcb, 1);
     if (s_worker) ESP_LOGI("WEREAD", "worker ready stack=%u", (unsigned)sizeof(s_worker_stack));
     else ESP_LOGE("WEREAD", "worker initialization failed");
 }
@@ -3458,20 +3720,25 @@ static void report_reading(void) {
     memcpy(job.book_id, s_reading.book.id, sizeof(job.book_id));
     memcpy(job.owner, s_reading.owner, sizeof(job.owner));
     portENTER_CRITICAL(&s_lock);
-    wr_report_t *empty = NULL, *entry = NULL;
+    wr_report_t *empty = NULL, *entry = NULL, *weakest = NULL;
     for (unsigned i = 0; i < sizeof(s_reports)/sizeof(s_reports[0]); ++i) {
         if (!s_reports[i].seconds) {
             if (!empty) empty = &s_reports[i];
         } else if (same_report_book(&job, &s_reports[i])) {
-            entry = &s_reports[i];
-            break;
+            /* 同一本书只在同一章内合并：跨章各占一条，补传时才能带着各自真实章节位置走。
+             * Merge within one chapter only: each chapter keeps its own real position at replay. */
+            if (s_reports[i].chapter == job.chapter) {
+                entry = &s_reports[i];
+                break;
+            }
+            if (!weakest || s_reports[i].seconds < weakest->seconds) weakest = &s_reports[i];
+        } else if (!weakest || s_reports[i].seconds < weakest->seconds) {
+            weakest = &s_reports[i];
         }
     }
     bool accepted = false;
     if (entry && seconds <= UINT32_MAX - entry->seconds) {
         entry->seconds += seconds;
-        /* 合并多批时把位置刷新到最近一次阅读处，避免长离线后仍报最早的冻结位置。 */
-        entry->chapter = job.chapter;
         entry->offset = job.offset;
         entry->pct = job.pct;
         /* 任一批来自离线/补传，合并后整批按补传上报。 */
@@ -3480,23 +3747,29 @@ static void report_reading(void) {
     } else if (!entry && empty) {
         *empty = job;
         accepted = true;
+    } else if (!entry && weakest && seconds <= UINT32_MAX - weakest->seconds) {
+        /* 24 个槽位用尽时并入秒数最少的一条，宁可牺牲一段位置精度，也不丢阅读时长。
+         * With all 24 slots used, fold into the smallest entry: keep the duration, trade a bit
+         * of position precision. */
+        weakest->seconds += seconds;
+        weakest->resend = true;
+        accepted = true;
     }
     portEXIT_CRITICAL(&s_lock);
     if (!accepted) return;
     s_reading.ms %= 1000;
     xTaskNotifyGive(s_worker);
-    /* 离线入队即落盘：没网时这批秒数没法立刻发，先写进队列，硬复位/断电（电池耗尽）也不丢。
-     * 仅在离线时写，在线链路保持原样、不增加任何写盘；每批约 60s 才触发一次，不磨损 SD。
-     * Persist only while offline: with no link the seconds cannot be sent now, so save them first
-     * and survive a hard reset or battery death. The online path is untouched (no extra write);
-     * this fires once per ~60 s batch, so it does not wear the SD. */
+    /* 离线入队后只置脏标记：真正写 SD 交给 worker，翻页线程不再每 60 秒卡一次写盘。
+     * Only flag dirty here: the worker does the SD write, so the paging thread no longer stalls
+     * on a card write every 60 s while reading offline. */
     if (!wr_online()) {
         /* 断网落盘：把仍在排队的批次一律标补传，覆盖"在线产生、尚未发出就断网"的情况。 */
         portENTER_CRITICAL(&s_lock);
         for (unsigned i = 0; i < sizeof(s_reports)/sizeof(s_reports[0]); ++i)
             if (s_reports[i].seconds) s_reports[i].resend = true;
         portEXIT_CRITICAL(&s_lock);
-        queue_persist();
+        s_queue_dirty = true;
+        xTaskNotifyGive(s_worker);
     }
 }
 
@@ -3526,14 +3799,34 @@ void wr_reading_tick(bool active, int64_t now_ms, unsigned chapter, unsigned off
             s_reading.ms += (unsigned)counted;
         }
     }
-    if (!active) radio_hold(false);
-    else if (wr_online()) radio_hold(true);
+    /* 每帧查一次联网状态会反复进网络锁；改成 1 秒采样一次，翻页路径只读缓存值。
+     * Sampling the link every frame repeatedly takes the netif lock; sample once a second and let
+     * the paging path read a cached flag instead. */
+    static int64_t online_checked_us;
+    static bool online_cached;
+    int64_t now_us = esp_timer_get_time();
+    if (!online_checked_us || now_us - online_checked_us >= 1000000) {
+        online_cached = wr_online();
+        online_checked_us = now_us;
+    }
+    /* 只有“正在读且在线”才需要常收；离线阅读没有可发的内容，继续常收只是白耗电。
+     * 链路恢复后下一次 tick 会重新常收，上报不受影响。
+     * Always-on RX is only needed while reading online; offline reading has nothing to send and
+     * holding it just drains the battery. The next tick re-holds once the link returns. */
+    radio_hold(active && online_cached);
     if (s_reading.ms >= 60000) report_reading();
 }
 
 void wr_reading_stop(bool close) {
     bool was_attached = s_reading.attached;
     if (was_attached) report_reading();
+    /* 停读是同步点：worker 可能还在睡，这里直接落盘，保证退出阅读后断电也不丢。
+     * Stopping is a sync point: persist right here so a power cut after leaving the reader keeps
+     * the batch even if the worker has not woken yet. */
+    if (was_attached && s_queue_dirty) {
+        s_queue_dirty = false;
+        if (!queue_persist()) s_queue_dirty = true;
+    }
     if (close && s_reading.ms >= 1000)
         ESP_LOGW("WEREAD", "report queue unavailable at close seconds=%u", s_reading.ms / 1000);
     /* 退出阅读：把本地真实位置登记为待同步（在线 worker 立即传，离线落盘、有网自动传）。

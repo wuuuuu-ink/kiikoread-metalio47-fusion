@@ -81,6 +81,7 @@ static bool reader_full_pages_valid(uint8_t pages) {
 #define NVS_KEY_BOOK_WEIGHT "bk_weight"
 #define NVS_KEY_BOOK_WEIGHT_FINE "bk_wfine"
 #define NVS_KEY_BOOK_AA "bk_aa"
+#define NVS_KEY_FAST_REPLAY "rd_fastrep"
 #define NVS_KEY_BOOK_BACKGROUND "bk_bg"
 #define NVS_KEY_READER_FULL "rd_gc16"
 #define NVS_KEY_READER_TURN "rd_turn"
@@ -150,6 +151,9 @@ static uint8_t s_book_px = 48;
 static uint8_t s_book_weight = 2;
 static int8_t s_book_weight_fine;
 static bool s_book_antialias = true;
+// 离线补传默认走"快速回放"（自适应分片），用户可在时长同步页关闭回到 30 秒节奏。
+// Offline replay defaults to adaptive chunks; the sync page can restore the 30 s pacing.
+static bool s_reader_fast_replay = true;
 static char s_book_background[288];
 static uint8_t s_reader_full_pages = 15;
 static uint8_t s_reader_turn_effect;
@@ -352,6 +356,8 @@ void app_settings_init(void) {
         s_book_weight_fine=(int)fine-APP_BOOK_WEIGHT_FINE_MAX;
     uint8_t antialias = 1;
     s_book_antialias = nvs_get_u8(h, NVS_KEY_BOOK_AA, &antialias) != ESP_OK || antialias != 0;
+    uint8_t fast_replay = 1;
+    s_reader_fast_replay = nvs_get_u8(h, NVS_KEY_FAST_REPLAY, &fast_replay) != ESP_OK || fast_replay != 0;
     uint8_t book_px = 48;
     if (nvs_get_u8(h, NVS_KEY_BOOK_PX, &book_px) == ESP_OK) s_book_px = valid_book_px(book_px);
     size_t background_len = sizeof(s_book_background);
@@ -757,6 +763,17 @@ bool app_settings_set_book_antialias(bool enabled) {
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     if (err == ESP_OK) s_book_antialias = enabled;
+    return err == ESP_OK;
+}
+bool app_settings_reader_fast_replay(void) { return s_reader_fast_replay; }
+bool app_settings_set_reader_fast_replay(bool enabled) {
+    if (enabled == s_reader_fast_replay) return true;
+    nvs_handle_t h;
+    if (nvs_open(NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t err = nvs_set_u8(h, NVS_KEY_FAST_REPLAY, enabled ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) s_reader_fast_replay = enabled;
     return err == ESP_OK;
 }
 int8_t app_settings_book_weight_fine(void) {return s_book_weight_fine;}

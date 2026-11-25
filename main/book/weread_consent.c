@@ -153,7 +153,12 @@ static char *http_call(const char *url, const char *post_body,
     char *result = NULL;
     size_t capacity = 0, used = 0;
     esp_err_t err = esp_http_client_open(http, body_len);
-    if (err != ESP_OK) goto done;
+    if (err != ESP_OK) {
+        /* TLS/DNS/连接失败必须留证据：扫码页只显示一句中文，串口要能区分"没网""证书没过""域名解析失败"。 */
+        ESP_LOGW(TAG, "http open fail %s host=%.60s err=%s", post_body ? "POST" : "GET", url,
+                 esp_err_to_name(err));
+        goto done;
+    }
     if (post_body) {
         int sent = 0;
         while (sent < body_len) {

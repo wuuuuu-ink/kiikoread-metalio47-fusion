@@ -122,7 +122,12 @@ void wr_cache_owner_fallback_clear(void) { s_owner_fallback[0] = 0; }
 
 static bool owner_of(char owner[WR_ID]) {
     owner[0] = 0;
-    return wr_account(owner, NULL, NULL) && owner[0];
+    /* 未登录时 token 为空，但 NVS 里保存的 owner 仍然有效：缓存徽标和章节目录不该因为
+     * 会话暂时失效（重新登录、续期、网页 token 被清）就全部变成“未缓存”。
+     * While logged out the token is empty, but the stored owner is still valid; cache badges and
+     * chapter paths must not turn into "not cached" just because the session is temporarily gone. */
+    (void)wr_account(owner, NULL, NULL);
+    return owner[0] != 0;
 }
 
 bool wr_stage_root(char *out, size_t cap, const char *book) {

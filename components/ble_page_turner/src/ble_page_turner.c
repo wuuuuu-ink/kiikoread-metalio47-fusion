@@ -125,6 +125,11 @@ static void lifecycle_give(void) { atomic_flag_clear(&s_lifecycle); }
 // 自动重连间隔。取值同 CrossMux 的 kReconnectBackoffMs。
 // Auto-reconnect interval, matching CrossMux's kReconnectBackoffMs.
 #define BLE_PT_RECONNECT_MS 4000
+// 重连退避上限：远端关机或走出范围后不再每 4 秒硬连一次，按 4→8→16→32→60 秒逐级拉长，
+// 把无效射频唤醒压到 1/15；设备回来后在最多 60 秒内重新连上。
+// Cap for reconnect back-off: 4, 8, 16, 32, then 60 s, cutting futile radio wake-ups to 1/15
+// while still reconnecting within a minute once the remote returns.
+#define BLE_PT_RECONNECT_MAX_MS 60000
 #define NVS_NS_BLE_STATE "rp_blestate"
 
 // 报告帧与键环的容量。报告一般 8-9 字节，留 16 足够覆盖带 report id 的复合设备。
@@ -196,6 +201,10 @@ static char s_start_failure[160];
 // switching it off is not immediately undone by the retry.
 static char s_reconnect_addr[18];
 static uint32_t s_reconnect_at;
+// 连续连接失败次数，用于自动重连的指数退避；成功建链或重新启用蓝牙时清零。
+// Consecutive connect failures driving the exponential reconnect back-off; cleared on a live
+// link and whenever the BLE stack is (re)started.
+static uint8_t s_reconnect_fails;
 // 快捷按钮只排队；在既有生命周期/网络内存闸门放行后，由poll发起一次异步连接。
 // Quick input only queues; poll starts one asynchronous connect after existing lifecycle/network memory gates allow it.
 static atomic_bool s_recent_requested;
@@ -714,9 +723,14 @@ void ble_pt_scan_start(uint32_t ms) {
     const struct ble_gap_disc_params params = {
         .itvl = 0, .window = 0, .filter_duplicates = 0, .passive = 0,
     };
-    if (ble_gap_disc(s_own_addr_type, (int32_t)ms, &params, scan_cb, NULL) == 0) {
+    const int rc = ble_gap_disc(s_own_addr_type, (int32_t)ms, &params, scan_cb, NULL);
+    if (rc == 0) {
         s_scanning = true;
     } else {
+        // 以前这里什么也不做：控制器拒绝扫描时界面一直空转，看不出是没扫到还是根本没扫。
+        // Report the refusal so an empty scan page can be told apart from a scan that never ran.
+        ESP_LOGW(TAG, "scan start failed (%d)", rc);
+        snprintf(s_failure, sizeof(s_failure), "扫描启动失败 (%d)", rc);
     }
 }
 
@@ -1301,12 +1315,16 @@ static int gap_cb(struct ble_gap_event *event, void *arg) {
                 // Whether to retry another address type or give up belongs to the state machine;
                 // this only reports the outcome.
                 snprintf(s_failure, sizeof(s_failure), "连接失败 (%d)", event->connect.status);
+                // 失败累加，poll() 里的重连间隔随之指数拉长。
+                // Count the failure so poll() stretches the next retry exponentially.
+                if (s_reconnect_fails < 8) ++s_reconnect_fails;
                 return 0;
             }
             remote_reset();
             s_conn_handle = event->connect.conn_handle;
             s_link_up = true;
             s_connecting = false;  // 链路已建立，"连接中"到此为止 / the link exists, so stop saying "connecting"
+            s_reconnect_fails = 0;  // 建链成功，退避归零 / a live link resets the back-off
             // 链路建立、加密、发现、订阅各打一行：带上时间戳就能看出卡在哪一步。
             // One line each for link up, encryption, discovery and subscription: with timestamps
             // it is obvious which step stalls.
@@ -1540,6 +1558,16 @@ esp_err_t ble_pt_connect(const char *addr) {
 void ble_pt_reconnect_recent(void) { atomic_store(&s_recent_requested,true); }
 void ble_pt_cancel_recent(void) { atomic_store(&s_recent_requested,false); }
 
+/* 自动重连间隔：每失败一次翻一倍，封顶 60 秒；成功建链后由事件清零。
+ * Auto-reconnect interval: doubles per failure up to 60 s, reset by a successful connect. */
+static uint32_t reconnect_delay_ms(void) {
+    uint32_t delay = BLE_PT_RECONNECT_MS;
+    for (uint8_t i = 0; i < s_reconnect_fails && delay < BLE_PT_RECONNECT_MAX_MS; ++i) {
+        delay *= 2;
+    }
+    return delay > BLE_PT_RECONNECT_MAX_MS ? BLE_PT_RECONNECT_MAX_MS : delay;
+}
+
 static void reconnect_recent_requested(void) {
     if(!atomic_exchange(&s_recent_requested,false)||s_link_up||s_connecting||!s_bond_count)return;
     const ble_pt_bond_t *recent=&s_bonds[s_bond_count-1];
@@ -1616,6 +1644,9 @@ static esp_err_t start_locked(void) {
     if (atomic_load(&s_network_users)) return ESP_ERR_INVALID_STATE;
 #endif
     if (s_running) return ESP_OK;
+    // 用户重新启用蓝牙：退避计数归零，第一轮就按 4 秒尝试。
+    // BLE re-enabled by the user: clear the back-off so the first retry is 4 s again.
+    s_reconnect_fails = 0;
 #if KIIKO_BOARD_METALIO47
     network_resume_peer();
 #else
@@ -1941,7 +1972,7 @@ static void poll_locked(void) {
     // fight, which shows up as an unstable connection (CrossMux guards with !scanning_ too).
     if (!s_link_up && !s_connecting && !s_scanning && s_reconnect_addr[0]) {
         const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-        if (now - s_reconnect_at >= BLE_PT_RECONNECT_MS) {
+        if (now - s_reconnect_at >= reconnect_delay_ms()) {
             s_reconnect_at = now;
             char addr[18];
             snprintf(addr, sizeof(addr), "%s", s_reconnect_addr);

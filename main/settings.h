@@ -130,6 +130,10 @@ bool app_settings_set_book_weight(int8_t level);
 /// 阅读抗锯齿默认开启；关闭只改变字形边缘，不改变排版或图片。/ Reading AA defaults on; disabling affects glyph edges, not layout or images.
 bool app_settings_book_antialias(void);
 bool app_settings_set_book_antialias(bool enabled);
+/// 微信读书离线时长快速补传：默认开启；关闭后回到 30 秒/30 秒的真实节奏回放。
+/// Fast offline reading-time replay: on by default; off restores the 30 s / 30 s pacing.
+bool app_settings_reader_fast_replay(void);
+bool app_settings_set_reader_fast_replay(bool enabled);
 uint8_t app_settings_book_px(void);
 /// 无效字号恢复 48。/ Invalid sizes fall back to 48.
 void app_settings_set_book_px(uint8_t px);

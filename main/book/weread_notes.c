@@ -43,10 +43,13 @@ static void *psram_calloc(size_t n, size_t size) {
     return heap_caps_calloc(n, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
 }
 
-/* 确保 s_crv 至少能容纳 need 条；容量按 64 条为一档增长，失败返回 false。 */
+/* 确保 s_crv 至少能容纳 need 条；容量按 64 条为一档增长，失败返回 false。
+ * 首次只分配 64 条（约 80 KB），没有公开段评的书不再为 400 条空槽付 510 KB PSRAM。
+ * Grow in 64-entry steps; the first allocation is 64 entries (~80 KB), so books without public
+ * reviews no longer reserve the full 400-slot array (~510 KB of PSRAM) on open. */
 static bool crv_ensure(size_t need) {
     if (need <= s_crv_cap) return true;
-    size_t cap = s_crv_cap ? s_crv_cap : WRN_CRV_MAX;
+    size_t cap = s_crv_cap ? s_crv_cap : 64;
     while (cap < need) cap += 64;
     wrn_chapter_review_t *grown =
         heap_caps_realloc(s_crv, cap * sizeof(*s_crv), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -306,10 +309,13 @@ bool wrn_open(const char *book_id) {
     s_bm = psram_calloc(WRN_BOOKMARK_MAX, sizeof(*s_bm));
     s_rv = psram_calloc(WRN_REVIEW_MAX, sizeof(*s_rv));
     s_best = psram_calloc(WRN_BEST_MAX, sizeof(*s_best));
-    s_crv = psram_calloc(WRN_CRV_MAX, sizeof(*s_crv));
-    s_crv_cap = s_crv ? WRN_CRV_MAX : 0;
+    /* 段评按章按需分配：大多数书没有公开段评，开书时不再预留 400 条空槽。 */
+    /* Chapter reviews allocate lazily: most books have none, so opening one no longer reserves
+     * the 400-slot array up front. */
+    s_crv = NULL;
+    s_crv_cap = 0;
     s_q = psram_calloc(WRN_QUEUE_MAX, sizeof(*s_q));
-    if (!s_bm || !s_rv || !s_best || !s_crv || !s_q) {
+    if (!s_bm || !s_rv || !s_best || !s_q) {
         ESP_LOGE(TAG, "alloc failed");
         return false;
     }
@@ -475,6 +481,7 @@ bool wrn_fetch_range_reviews(const char *chapter_uid, const char *range) {
     cJSON *resp = cJSON_Parse(resp_text);
     free(resp_text);
     if (!resp) { ESP_LOGW(TAG, "range readreviews non-JSON"); return false; }
+    /* 段评缓冲懒分配：merge_reviews 每加一条都先 crv_ensure，首次 64 条起，空回包不占内存。 */
     unsigned got = merge_reviews(resp, chapter_uid, range, s_crv, &s_crv_n);
     cJSON_Delete(resp);
     ESP_LOGI(TAG, "range reviews chapter=%s range=%s got=%u", chapter_uid, range, got);

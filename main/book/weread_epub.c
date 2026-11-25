@@ -40,7 +40,11 @@
  * completed ones, the next run resumes at the gap, and chapter images come from the
  * bundled archive instead of one request per <img>. */
 #define WR_BUNDLE_ENTRY_MAX 512
-#define WR_BUNDLE_MAX_BYTES (24u * 1024u * 1024u)
+/* 章包上限按 16 MB PSRAM 定：实测最大约 3 MB（漫画章），8 MB 留 2.6 倍余量，
+ * 又保证解包/解析/页缓存至少还有 4 MB 可用；24 MB 超过整块 PSRAM，永远不可能分配成功。
+ * Cap the bundle for the 16 MB PSRAM board: the largest measured bundle is ~3 MB (comics), so 8 MB
+ * keeps 2.6x headroom while leaving 4 MB+ for unzip/DOM/page caches; 24 MB could never be allocated. */
+#define WR_BUNDLE_MAX_BYTES (8u * 1024u * 1024u)
 /*
  * 一个章包的下载预算。把发射功率从 12 dBm 提到 18 dBm 之后，实测 370 KB 的章包从 63 秒
  * 降到 14 秒（26 KB/s），3 MB 的漫画章包约需两分钟——150 秒留出余量，又不至于让整章缓存

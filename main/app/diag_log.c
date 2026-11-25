@@ -208,6 +208,11 @@ static bool diag_allow_locked(const char *line, size_t n) {
 
 static void file_open_append(void) {
     if (s_file || s_suspended) return;
+    /* 内部 RAM 告急时跳过落盘：fopen 内部会懒创建文件锁互斥量，若 xQueueCreateMutex
+     * 因内部 RAM 耗尽返回 NULL 会触发 abort，把整机拖崩。留 8KB 余量。
+     * Skip flush when internal RAM is critically low; fopen lazily creates a file-lock
+     * mutex whose allocation failure (OOM) aborts the whole system. Keep an 8KB margin. */
+    if (heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 8192) return;
     mkdir(DIAG_DIR, 0777);
     s_file = fopen(DIAG_FILE, "ab");
     if (s_file) {

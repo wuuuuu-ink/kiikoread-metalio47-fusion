@@ -618,6 +618,15 @@ typedef struct { uint8_t *gray; int width, height; } reader_image_t;
 static reader_image_t *s_page_images;
 static int s_page_image_count;
 static size_t s_page_images_for = SIZE_MAX;
+/* 下一页插图预解码：带图页单页要解 3–7 秒，放在翻页路径上就是明显卡顿。
+ * 空闲时把下一页的插图先解到 PSRAM，翻页只做合成；页号/布局代次对不上就丢弃重解。
+ * Next-page illustration prefetch: decoding one page takes seconds, so an illustrated turn feels
+ * frozen. Decode it during idle into PSRAM and let the turn only composite; a page/generation
+ * mismatch drops the cache and decodes normally. */
+static reader_image_t *s_prefetch_images;
+static int s_prefetch_count;
+static size_t s_prefetch_for = SIZE_MAX;
+static uint32_t s_prefetch_generation;
 static uint32_t s_page_images_generation;
 /// 一页插图解码：按槽位顺序解成灰阶位图，解不出来的槽位留空。
 /// Decode one page's illustrations into grayscale bitmaps in slot order; failed slots stay empty.
@@ -751,6 +760,8 @@ static void before_lock(app_ctx_t *ctx);
 static void invalidate_prep(void);
 static void prepare_inline_image(void);
 static void release_page_images(void);
+static void release_prefetch_images(void);
+static void prefetch_next_images(void);
 static void sort_shelf(app_ctx_t* ctx);
 static void prepare_covers(app_ctx_t* ctx);
 static app_redraw_t toggle_reader_fullscreen(app_ctx_t* ctx);
@@ -5562,6 +5573,12 @@ static void reader_prefetch_idle(app_ctx_t *ctx) {
         const int64_t deadline=esp_timer_get_time()+BOOK_PREP_IDLE_US;
         for(unsigned row=0;row<8;++row)
             if(reader_prefetch_step()!=0||esp_timer_get_time()>=deadline)break;
+    } else {
+        /* 没有可预排的文字页时，先解下一页插图：翻过去就不用再等 3–7 秒的解码。
+         * Without a text page to prepare, decode the next page's illustrations so the turn does
+         * not sit in the decoder. */
+        prefetch_next_images();
+    }
 #else
     if(s_view!=READING||!s_text||s_toolbar||s_clear_confirm||s_reader_panel!=READER_PANEL_NONE||
        ctx->consumed||ctx->request_app||ctx->request_return||
@@ -5571,10 +5588,9 @@ static void reader_prefetch_idle(app_ctx_t *ctx) {
     if(s_next_page==s_prep_page&&s_next_generation==book_layout_generation())return;
     if(!reader_prefetch_buffer())return;
     const int64_t deadline=esp_timer_get_time()+BOOK_PREP_IDLE_US;
-    for(unsigned row=0;row<8;++row){
+    for(unsigned row=0;row<8;++row)
         if(reader_prefetch_step()!=0||esp_timer_get_time()>=deadline)break;
 #endif
-    }
 #if KIIKO_BOARD_METALIO47
     unlock_draw();
 #else
@@ -6548,6 +6564,7 @@ static void free_book(void) {
     free(s_images);
     s_images = NULL; s_image_count = 0;
     release_page_images();
+    release_prefetch_images();
     s_reader_image_refresh_pending = false;
     s_blocks = NULL;
     s_block_count = 0;
@@ -6594,6 +6611,31 @@ static void release_page_images(void) {
     for (int i = 0; i < s_page_image_count; ++i) free(s_page_images[i].gray);
     free(s_page_images); s_page_images = NULL; s_page_image_count = 0;
     s_page_images_for = SIZE_MAX;
+}
+static void release_prefetch_images(void) {
+    for (int i = 0; i < s_prefetch_count; ++i) free(s_prefetch_images[i].gray);
+    free(s_prefetch_images); s_prefetch_images = NULL; s_prefetch_count = 0;
+    s_prefetch_for = SIZE_MAX;
+}
+/* 空闲预解下一页插图：只在 PSRAM 余量充足时做，避免把正文页挤出去。
+ * Prefetch the next page's illustrations during idle, only with ample PSRAM left. */
+static void prefetch_next_images(void) {
+    if (app_settings_reader_hide_images() || s_view != READING || !s_text) return;
+    uint32_t generation = book_layout_generation();
+    size_t page = s_page + 1;
+    if (page >= book_layout_page_count()) { release_prefetch_images(); return; }
+    if (s_prefetch_images && s_prefetch_for == page && s_prefetch_generation == generation) return;
+    if (!book_layout_page_image_count(page)) { release_prefetch_images(); return; }
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) < 2u * 1024u * 1024u) return;
+    release_prefetch_images();
+    reader_image_t *images = NULL;
+    int count = decode_page_images(page, &images);
+    if (!images) return;
+    s_prefetch_images = images;
+    s_prefetch_count = count;
+    s_prefetch_for = page;
+    s_prefetch_generation = generation;
+    ESP_LOGI(TAG, "prefetched %d image slot(s) for next page %u", count, (unsigned)page + 1);
 }
 /* ------------------------------------------------------------------ */
 /* 页图缓存：解码后的灰阶位图，按（页，布局代次）存放                   */
@@ -6700,7 +6742,7 @@ static int decode_page_images(size_t page, reader_image_t **out) {
     return count;
 }
 static void prepare_inline_image(void) {
-    if (app_settings_reader_hide_images()) { release_page_images(); return; }
+    if (app_settings_reader_hide_images()) { release_page_images(); release_prefetch_images(); return; }
     uint32_t generation = book_layout_generation();
     if (s_page_images_for == s_page && s_page_images_generation == generation) return;
     // 纯文字跨页不应作废已排好的下一页；布局代次改变或本页有插图时才失效。
@@ -6708,6 +6750,18 @@ static void prepare_inline_image(void) {
     // illustrated page.
     const bool changed_layout_or_image = s_page_images_generation != generation || s_page_image_count > 0;
     release_page_images();
+    /* 命中空闲预解码：直接接管位图，本页翻页不再花 3–7 秒解图。
+     * A prefetched set is adopted here, so this turn no longer spends seconds decoding. */
+    if (s_prefetch_images && s_prefetch_for == s_page && s_prefetch_generation == generation) {
+        if (changed_layout_or_image || reader_image_slots(s_page) > 0) invalidate_prep();
+        s_page_images = s_prefetch_images;
+        s_page_image_count = s_prefetch_count;
+        s_page_images_for = s_page;
+        s_page_images_generation = generation;
+        s_prefetch_images = NULL; s_prefetch_count = 0; s_prefetch_for = SIZE_MAX;
+        ESP_LOGI(TAG, "page %u: using prefetched images", (unsigned)s_page + 1);
+        return;
+    }
     s_page_images_for = s_page; s_page_images_generation = generation;
     int count = reader_image_slots(s_page);
     if (changed_layout_or_image || count > 0) invalidate_prep();

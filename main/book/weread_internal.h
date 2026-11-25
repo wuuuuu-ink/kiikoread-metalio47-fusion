@@ -86,6 +86,9 @@ int wr_last_http_status(void);
 /// 用已存 consent 三件套经 /web/login/session/init 自动建立网页会话（免二次扫码）。
 /// Mint the web session from stored consent tokens via /web/login/session/init, no second QR.
 bool wr_mint_web_session(void);
+/// 手动续期网页会话（wr_rt 续期 → consent 重新 mint），成功返回 true；全程免扫码。
+/// Manually renew the web session (wr_rt renewal, then consent mint); true on success, no QR scan.
+bool wr_renew_session(void);
 /// 只清网页会话（账号 token + wr_* cookie），不删书、不碰 consent、无 busy 守卫。
 /// 供 consent 取消授权时调用，保证网页侧登录态与 consent 同时失效。
 /// Clear only the web session (account token + wr_* cookies), no books, no consent, no busy guard.

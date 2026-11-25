@@ -350,6 +350,26 @@ static void lock_hint_end(void) {
     s_lock_hint_hl=NULL;
 }
 
+// 定时关机前先把锁屏壁纸整帧推到面板；壁纸锁屏且当前帧已缓存时不重复刷屏。
+// Present the configured lock wallpaper before a timed power-off; skip the refresh when
+// wallpaper mode is already showing its cached frame.
+static bool lock_poweroff_wallpaper(void) {
+    if(app_settings_lock_style()==1 && s_lock_frame_cached && !lock_pin_enabled()) return true;
+    EpdiyHighlevelState *hl=s_lock_hint_hl;
+    const char *path=app_settings_wallpaper_path();
+    if(!hl || !path || !path[0]) return false;
+    uint8_t *fb=epd_hl_get_framebuffer(hl);
+    if(!fb || !ui_wallpaper_prepare_lock(fb,path)) return false;
+    epd_poweron();
+    enum EpdDrawError result=update_display_full(hl);
+    if(result!=EPD_DRAW_SUCCESS) guard_draw_result(hl,result);
+    epd_poweroff();
+    if(result!=EPD_DRAW_SUCCESS) return false;
+    ui_wallpaper_cache_commit(fb);
+    ESP_LOGI(TAG,"S31 power-off wallpaper presented");
+    return true;
+}
+
 // 锁屏策略可保持浅睡或到时关机；USB/输入和交接失败保持锁定。
 // Lock policy may remain in light sleep or power off on deadline; failed handoffs retain the gate.
 app_wake_source_t app_light_sleep_wait_timed(sc7a20h_handle_t acc,uint32_t timeout_ms) {
@@ -368,7 +388,7 @@ app_wake_source_t app_light_sleep_wait_timed(sc7a20h_handle_t acc,uint32_t timeo
         app_settings_staged_shutdown()?APP_LOCK_OFF_AFTER_US:1;
     int64_t off_at=s_lock_sleep_touch&&!timeout_ms&&off_delay ? start+off_delay : 0;
     int64_t off_retry_at=off_at;
-    bool frame_marked=false,frame_mark_attempted=false;
+    bool frame_marked=false,frame_mark_attempted=false,wallpaper_done=false;
     unsigned light_failures=0;
     int64_t light_retry_at=0;
     ESP_LOGI(TAG,"S31 lock wait: off_delay_ms=%lld usb=%u pickup=%u checkpoint=%u",
@@ -388,7 +408,15 @@ app_wake_source_t app_light_sleep_wait_timed(sc7a20h_handle_t acc,uint32_t timeo
         lock_hint_service();
         if (!s_lock_hint.pending_at && !s_lock_hint.until && s_lock_sleep_touch && !pickup && !usb) {
             if(off_at && esp_timer_get_time()>=off_retry_at && s_lock_deep_ready) {
-                if(s_lock_frame_cached && !lock_pin_enabled() && !frame_marked && !frame_mark_attempted) {
+                // 关机流程先完成壁纸渲染，再进入断电交接；失败沿用当前锁屏画面。
+                // Render the wallpaper before the power-off handoff; keep the current lock art on failure.
+                if(!wallpaper_done) {
+                    wallpaper_done=lock_poweroff_wallpaper();
+                    // 物理画面已换壁纸，旧锁图缓存不再代表当前帧，禁止标记为可恢复。
+                    // The physical frame is now wallpaper, so the old art cache must not be marked current.
+                    if(wallpaper_done) s_lock_frame_cached=false;
+                }
+                if(!wallpaper_done && s_lock_frame_cached && !lock_pin_enabled() && !frame_marked && !frame_mark_attempted) {
                     frame_mark_attempted=true;
                     frame_marked=pico_boot_mark_frame_cached()==ESP_OK;
                 }
@@ -404,6 +432,13 @@ app_wake_source_t app_light_sleep_wait_timed(sc7a20h_handle_t acc,uint32_t timeo
                 int64_t wake_by=deadline;
                 if(off_at && s_lock_deep_ready && (!wake_by || off_retry_at<wake_by)) wake_by=off_retry_at;
                 bool off_deadline=off_at && s_lock_deep_ready && wake_by==off_retry_at;
+                // 浅睡到点后可能直接在停放状态下断电，不经过外层交接；截止前先把壁纸推上面板。
+                // A deadline slice can cut power while parked without returning here, so render the
+                // wallpaper before entering that slice.
+                if(off_deadline && !wallpaper_done) {
+                    wallpaper_done=lock_poweroff_wallpaper();
+                    if(wallpaper_done) s_lock_frame_cached=false;
+                }
                 if(off_deadline && s_lock_frame_cached && !lock_pin_enabled() && !frame_marked && !frame_mark_attempted) {
                     frame_mark_attempted=true;
                     frame_marked=pico_boot_mark_frame_cached()==ESP_OK;
