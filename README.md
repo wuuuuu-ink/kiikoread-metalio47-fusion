@@ -67,9 +67,13 @@ python tools/build_firmware.py --board metalio47 --idf-metalio47 "$IDF_PATH" --p
 
 ## 致谢
 
-- 整机固件底座：厂长 **kiikoread**
-- 微信读书功能框架：**设计君的日常碎碎念**（[kiikoreader-wereader](https://github.com/YIYO-Designer/kiikoreader-wereader)）
+- 整机固件底座：厂长 **kiikoread**（GitHub: [wegooo-cell](https://github.com/wegooo-cell)）
+  - Metalio S31 源码：[wegooo-cell/Metalio-S31-kiikoread](https://github.com/wegooo-cell/Metalio-S31-kiikoread)
+  - Pico 项目：[wegooo-cell/read-pico-reader](https://github.com/wegooo-cell/read-pico-reader)
+- 微信读书功能框架：**设计君的日常碎碎念**（[YIYO-Designer/kiikoreader-wereader](https://github.com/YIYO-Designer/kiikoreader-wereader)）
 - 划线实现参考：**沉在阅读**（GitHub: [cyongxiang](https://github.com/cyongxiang)）
+- 更上游的 Pico 示例固件：[MindReset/read_pico_firmware](https://github.com/MindReset/read_pico_firmware)（Apache-2.0）
+- 硬件参考：[CloudZao/Metalio-E-INK4-Plus](https://github.com/CloudZao/Metalio-E-INK4-Plus)
 
 ## 安全
 
