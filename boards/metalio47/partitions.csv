@@ -1,0 +1,10 @@
+# Name, Type, SubType, Offset, Size, Flags
+# 16MB flash。两个 OTA 槽 6MB（原 5MB），给应用留出约 1.07MB 余量；内部 storage 相应缩到 3.875MB。
+# 16MB flash. Both OTA slots are 6MB (was 5MB) so the app keeps ~1.07MB headroom; internal storage shrinks to 3.875MB.
+nvs,data,nvs,0x9000,0x4000,
+otadata,data,ota,0xd000,0x2000,
+phy_init,data,phy,0xf000,0x1000,
+ota_0,app,ota_0,0x10000,0x600000,
+ota_1,app,ota_1,0x610000,0x600000,
+storage,data,fat,0xc10000,0x3e0000,
+coredump,data,coredump,0xff0000,0x10000,
